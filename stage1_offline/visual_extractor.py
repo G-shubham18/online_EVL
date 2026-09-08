@@ -43,6 +43,10 @@ from config import (
     OLLAMA_HOST,
     OPENAI_API_KEY,
     GPT_MODEL,
+    ACTIVE_CAPTION_MODEL,
+    SUPPORTED_CAPTION_MODELS,
+    HF_TOKEN,
+    USE_API,
 )
 from stage1_offline.object_detector import ObjectDetector
 
@@ -75,11 +79,22 @@ Visible Text & Labels: Any readable text or brands.
 Be factual, specific, and concise without filler."""
 
 class VisualExtractor:
-    def __init__(self):
+    def __init__(self, caption_model: str = None, use_api: bool = None):
         self.openai_api_key = os.getenv("OPENAI_API_KEY", OPENAI_API_KEY)
         self.gpt_model = os.getenv("GPT_MODEL", GPT_MODEL)
+        self.caption_model = caption_model if caption_model else os.getenv("CAPTION_MODEL", ACTIVE_CAPTION_MODEL)
+        self.use_api = use_api if use_api is not None else USE_API
+        self.hf_token = HF_TOKEN
+        self._hf_client = None
+
         self.model = None
         self.processor = None
+        self.blip_processor = None
+        self.blip_model = None
+        self.smol_processor = None
+        self.smol_model = None
+        self.moondream_tokenizer = None
+        self.moondream_model = None
 
         # Load CLIP embedding model once in constructor
         print(f"Loading CLIP Embedding Model: {CLIP_MODEL}")
@@ -97,10 +112,7 @@ class VisualExtractor:
 
         # Object Detection & Tracking (RT-DETR + GroundingDINO + SimpleSort)
         self.object_detector = ObjectDetector()
-
-        # If no OpenAI API key is configured, load local VLM eagerly
-        if not self.openai_api_key:
-            self._load_local_vlm()
+        print(f"[VisualExtractor] Initialized with Captioning Model: {self.caption_model} (use_api={self.use_api})")
 
     def _load_local_vlm(self):
         if self.model is not None:
@@ -195,6 +207,177 @@ class VisualExtractor:
         except Exception as e:
             print(f"[VisualExtractor Warning] GPT-4o-mini frame captioning error: {e}")
             return None
+
+    def _caption_frame_api(self, pil_image: Image.Image) -> Optional[str]:
+        """Calls Hugging Face Inference API for image captioning."""
+        try:
+            from huggingface_hub import InferenceClient
+            if self._hf_client is None:
+                self._hf_client = InferenceClient(token=self.hf_token if self.hf_token else None)
+            
+            # 1. Try image_to_text endpoint
+            try:
+                res = self._hf_client.image_to_text(pil_image, model=self.caption_model)
+                if isinstance(res, str) and res.strip():
+                    return res.strip()
+                elif hasattr(res, "generated_text") and res.generated_text:
+                    return res.generated_text.strip()
+            except Exception:
+                pass
+
+            # 2. Try chat completion with base64 encoded image
+            import io, base64
+            buf = io.BytesIO()
+            img_c = pil_image.copy()
+            img_c.thumbnail((512, 512))
+            img_c.save(buf, format="JPEG", quality=85)
+            b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
+            data_url = f"data:image/jpeg;base64,{b64_str}"
+
+            chat_res = self._hf_client.chat_completion(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this video frame accurately and concisely."},
+                            {"type": "image_url", "image_url": {"url": data_url}}
+                        ]
+                    }
+                ],
+                model=self.caption_model,
+                max_tokens=150,
+            )
+            raw = chat_res.choices[0].message.content.strip()
+            if raw:
+                return raw
+        except Exception as e:
+            print(f"[VisualExtractor Notice] HF Caption API notice: {e}")
+        return None
+
+    def _load_local_caption_model(self):
+        """Lazily loads the configured captioning model locally."""
+        model_name = self.caption_model.lower()
+
+        # 1. BLIP Family (Base & Large)
+        if "blip" in model_name:
+            if self.blip_model is not None:
+                return
+            print(f"[VisualExtractor] Loading local BLIP model: {self.caption_model}...")
+            from transformers import BlipProcessor, BlipForConditionalGeneration
+            self.blip_processor = BlipProcessor.from_pretrained(self.caption_model)
+            self.blip_model = BlipForConditionalGeneration.from_pretrained(
+                self.caption_model,
+                torch_dtype=TORCH_DTYPE if IS_GPU else torch.float32
+            ).to(DEVICE)
+            self.blip_model.eval()
+            print(f"[VisualExtractor] Successfully loaded BLIP model on {DEVICE}.")
+            return
+
+        # 2. SmolVLM Family
+        if "smolvlm" in model_name:
+            if self.smol_model is not None:
+                return
+            print(f"[VisualExtractor] Loading local SmolVLM model: {self.caption_model}...")
+            from transformers import AutoProcessor
+            try:
+                from transformers import SmolVLMForConditionalGeneration
+                smol_cls = SmolVLMForConditionalGeneration
+            except ImportError:
+                from transformers import AutoModelForImageTextToText
+                smol_cls = AutoModelForImageTextToText
+            self.smol_processor = AutoProcessor.from_pretrained(self.caption_model)
+            self.smol_model = smol_cls.from_pretrained(
+                self.caption_model,
+                torch_dtype=TORCH_DTYPE if IS_GPU else torch.float32
+            ).to(DEVICE)
+            self.smol_model.eval()
+            print(f"[VisualExtractor] Successfully loaded SmolVLM model on {DEVICE}.")
+            return
+
+        # 3. Moondream Family
+        if "moondream" in model_name:
+            if self.moondream_model is not None:
+                return
+            print(f"[VisualExtractor] Loading local Moondream model: {self.caption_model}...")
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            self.moondream_tokenizer = AutoTokenizer.from_pretrained(self.caption_model, trust_remote_code=True)
+            self.moondream_model = AutoModelForCausalLM.from_pretrained(
+                self.caption_model,
+                trust_remote_code=True,
+                torch_dtype=TORCH_DTYPE if IS_GPU else torch.float32
+            ).to(DEVICE)
+            self.moondream_model.eval()
+            print(f"[VisualExtractor] Successfully loaded Moondream model on {DEVICE}.")
+            return
+
+        # 4. Default / Qwen-VL Fallback
+        self._load_local_vlm()
+
+    def _caption_blip(self, pil_image: Image.Image) -> str:
+        self._load_local_caption_model()
+        inputs = self.blip_processor(images=pil_image, return_tensors="pt").to(DEVICE)
+        with torch.no_grad():
+            out = self.blip_model.generate(**inputs, max_new_tokens=64)
+        caption = self.blip_processor.decode(out[0], skip_special_tokens=True).strip()
+        return caption
+
+    def _caption_smolvlm(self, pil_image: Image.Image) -> str:
+        self._load_local_caption_model()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "Describe this video frame concisely, focusing on people, objects, actions, and setting."}
+                ]
+            }
+        ]
+        prompt = self.smol_processor.apply_chat_template(messages, add_generation_prompt=True)
+        inputs = self.smol_processor(text=prompt, images=[pil_image], return_tensors="pt").to(DEVICE)
+        with torch.no_grad():
+            generated_ids = self.smol_model.generate(**inputs, max_new_tokens=80)
+        caption = self.smol_processor.batch_decode(
+            generated_ids[:, inputs.input_ids.shape[1]:], 
+            skip_special_tokens=True
+        )[0].strip()
+        return caption
+
+    def _caption_moondream(self, pil_image: Image.Image) -> str:
+        self._load_local_caption_model()
+        enc_image = self.moondream_model.encode_image(pil_image)
+        caption = self.moondream_model.answer_question(
+            enc_image, 
+            "Describe this video scene in detail.", 
+            tokenizer=self.moondream_tokenizer
+        ).strip()
+        return caption
+
+    def caption_frame(self, pil_image: Image.Image, tracking_summary: str = "") -> str:
+        """Captions a single frame using the configured model via API or local fallback."""
+        # 1. Try Hugging Face API if enabled
+        if self.use_api and self.hf_token:
+            api_cap = self._caption_frame_api(pil_image)
+            if api_cap:
+                return api_cap
+
+        # 2. Local Model Inference
+        model_name = self.caption_model.lower()
+        if "blip" in model_name:
+            return self._caption_blip(pil_image)
+        elif "smolvlm" in model_name:
+            return self._caption_smolvlm(pil_image)
+        elif "moondream" in model_name:
+            return self._caption_moondream(pil_image)
+        elif "gpt" in model_name and self.openai_api_key:
+            gpt_cap = self.caption_frame_gpt4o_mini(pil_image, tracking_summary=tracking_summary)
+            if gpt_cap:
+                return gpt_cap
+
+        # Fallback to local BLIP or simple placeholder
+        try:
+            return self._caption_blip(pil_image)
+        except Exception:
+            return "Video keyframe scene."
 
     def evaluate_image_quality(self, frame_bgr: np.ndarray) -> dict:
         """
@@ -775,7 +958,27 @@ class VisualExtractor:
         else:
             tracking_summaries = ["None detected."] * num_keyframes
 
-        # Step 2: Generate descriptions using GPT-4o-mini if API key is present
+        # Step 2: Use configured Captioning Model (BLIP, SmolVLM, Moondream, etc.)
+        model_name = self.caption_model.lower()
+        if any(m in model_name for m in ["blip", "smolvlm", "moondream"]):
+            print(f"Generating visual descriptions using '{self.caption_model}' for {num_keyframes} keyframes (use_api={self.use_api})...")
+            for kf, track_summary in zip(keyframes, tracking_summaries):
+                desc = self.caption_frame(kf["image"], tracking_summary=track_summary)
+                if track_summary and track_summary != "None detected." and track_summary not in desc:
+                    desc += f"\n- Tracked Objects & Motion: {track_summary}"
+                print(f"  [Frame {kf['frame_id']} @ {kf['mid_time']:.2f}s]: Generated description via {self.caption_model}.")
+                results.append(
+                    {
+                        "type": "visual",
+                        "frame_id": kf["frame_id"],
+                        "start_time": kf["start_time"],
+                        "end_time": kf["end_time"],
+                        "text": desc,
+                    }
+                )
+            return results
+
+        # Step 3: Generate descriptions using GPT-4o-mini if API key is present
         api_key = os.getenv("OPENAI_API_KEY", self.openai_api_key)
         if api_key:
             print(f"Generating visual descriptions using GPT-4o-mini for {num_keyframes} keyframes...")

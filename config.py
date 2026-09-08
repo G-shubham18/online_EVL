@@ -46,6 +46,39 @@ print(f"[Hardware Setup] Pipeline Running in Dual Mode: {'GPU (' + str(DEVICE) +
 print(f"[Hardware Setup] Selected Data Type: {TORCH_DTYPE}")
 
 # Model Identifiers (Configurable via Environment Variables for Cloud/Colab/Kaggle)
+# Multi-Model Benchmark Configurations
+SUPPORTED_LLM_MODELS = {
+    "qwen2.5-v1-72b-instruct": "Qwen/Qwen2.5-VL-72B-Instruct",
+    "qwen2.5-vl-72b-instruct": "Qwen/Qwen2.5-VL-72B-Instruct",
+    "qwen2.5-72b-instruct": "Qwen/Qwen2.5-72B-Instruct",
+    "gemma-4-31b": "google/gemma-4-31b-it",
+    "gemma-2-27b": "google/gemma-2-27b-it",
+    "phi-3.5-vision-instruct": "microsoft/Phi-3.5-vision-instruct",
+}
+
+SUPPORTED_CAPTION_MODELS = [
+    "Salesforce/blip-image-captioning-base",
+    "Salesforce/blip-image-captioning-large",
+    "HuggingFaceTB/SmolVLM-256M-Instruct",
+    "wraps/moondream-caption",
+]
+
+SUPPORTED_AUDIO_EMBED_MODELS = [
+    "FacebookAI/roberta-base",
+    "laion/clap-htsat-unfused",
+]
+
+# API Keys & Serverless Endpoints
+HF_TOKEN = os.getenv("HF_TOKEN", os.getenv("HUGGINGFACE_API_KEY", os.getenv("HUGGINGFACEHUB_API_TOKEN", "")))
+USE_API = os.getenv("USE_API", "1").lower() in ("1", "true", "yes")
+LLM_API_BASE = os.getenv("LLM_API_BASE", os.getenv("OPENAI_BASE_URL", ""))
+LLM_API_KEY = os.getenv("LLM_API_KEY", os.getenv("HF_TOKEN", os.getenv("OPENAI_API_KEY", "")))
+
+# Active Model Selectors (Configurable via CLI or Env Vars)
+ACTIVE_LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5-v1-72b-instruct")
+ACTIVE_CAPTION_MODEL = os.getenv("CAPTION_MODEL", "Salesforce/blip-image-captioning-base")
+ACTIVE_AUDIO_EMBED_MODEL = os.getenv("AUDIO_EMBED_MODEL", "FacebookAI/roberta-base")
+
 # Stage 1: Extraction & Indexing
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "large-v3-turbo")  # Timestamped speech transcription
 AST_MODEL = os.getenv("AST_MODEL", "MIT/ast-finetuned-audioset-10-10-0.4593")  # Audio Spectrogram Transformer
@@ -75,7 +108,7 @@ BM25_WEIGHT = float(os.getenv("BM25_WEIGHT", "0.4"))
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 HF_LLM_MODEL = os.getenv("HF_LLM_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
-LLM_BACKEND = os.getenv("LLM_BACKEND", "gpt" if os.getenv("OPENAI_API_KEY") else "auto")  # "gpt", "auto", "ollama", "hf"
+LLM_BACKEND = os.getenv("LLM_BACKEND", "api" if (HF_TOKEN or LLM_API_KEY or os.getenv("OPENAI_API_KEY")) else "auto")  # "api", "gpt", "auto", "ollama", "hf"
 
 # Ingestion concurrency (Sequential default on single GPU like T4 prevents VRAM spikes)
 CONCURRENT_INGESTION = os.getenv("CONCURRENT_INGESTION", "0").lower() in ("1", "true", "yes")

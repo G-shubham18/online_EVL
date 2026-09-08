@@ -11,7 +11,10 @@ from dataclasses import dataclass
 
 from config import (
     KA_DEFAULT, KV_DEFAULT, VECTOR_STORE_DIR,
-    STORE_MODES, RERANK_MODES, SUFFICIENCY_MODES, MODALITY_MODES, ABLATION_PRESETS
+    STORE_MODES, RERANK_MODES, SUFFICIENCY_MODES, MODALITY_MODES, ABLATION_PRESETS,
+    ACTIVE_LLM_MODEL, ACTIVE_CAPTION_MODEL, ACTIVE_AUDIO_EMBED_MODEL,
+    SUPPORTED_LLM_MODELS, SUPPORTED_CAPTION_MODELS, SUPPORTED_AUDIO_EMBED_MODELS,
+    USE_API, HF_TOKEN, LLM_API_BASE, LLM_API_KEY
 )
 from ingestion import Stage1Ingestor, discover_videos, get_video_store_dir
 from stage1_offline.vector_indexer import VectorIndexer
@@ -416,11 +419,51 @@ def compute_evaluation_metrics(questions_list: List[Dict[str, Any]]) -> Dict[str
     }
 
 
+def run_single_pipeline(
+    video_path: str,
+    question: str,
+    force_reindex: bool = False,
+    ablation_config: Optional[AblationConfig] = None,
+    llm_model: Optional[str] = None,
+    caption_model: Optional[str] = None,
+    audio_embed_model: Optional[str] = None,
+    use_api: Optional[bool] = None,
+    hf_token: Optional[str] = None,
+    llm_api_base: Optional[str] = None
+) -> str:
+    """Runs end-to-end question answering on a single video file."""
+    print(f"\n[EchoVision Single Video QA] Video: {video_path}")
+    print(f"Question: {question}")
+    cfg = ablation_config if ablation_config else AblationConfig()
+    ingestor = Stage1Ingestor(
+        caption_model=caption_model,
+        audio_embed_model=audio_embed_model,
+        use_api=use_api
+    )
+    indexer, _, err = ingestor.process_single_video(video_path, force_reindex=force_reindex)
+    if indexer is None:
+        print(f"Error during video ingestion: {err}")
+        return f"Error: {err}"
+    shared_components = {
+        'qc': QuestionClassifier(),
+        'dedup': Deduplicator(),
+        'reranker': ReRanker(),
+        'gate': SufficiencyGate(),
+        'generator': Generator(model=llm_model, api_base=llm_api_base, api_key=hf_token)
+    }
+    answer = answer_question_for_video(indexer, question, shared_components, ablation_config=cfg)
+    print(f"\nPredicted Answer: {answer}")
+    return answer
+
+
 def load_stage1_indices(
     videos_dir: str,
     base_store_dir: Optional[str] = None,
     allow_auto_ingest: bool = False,
-    force_reindex: bool = False
+    force_reindex: bool = False,
+    audio_embed_model: Optional[str] = None,
+    caption_model: Optional[str] = None,
+    use_api: Optional[bool] = None
 ) -> Dict[str, Dict]:
     """
     Scans videos_dir and loads existing Stage 1 vector stores from disk.
@@ -436,8 +479,17 @@ def load_stage1_indices(
     missing_videos = []
 
     for video_path in discovered_videos:
-        store_dir = get_video_store_dir(video_path, base_store_dir)
-        indexer = VectorIndexer(store_dir=store_dir)
+        store_dir = get_video_store_dir(
+            video_path, 
+            base_store_dir,
+            audio_embed_model=audio_embed_model,
+            caption_model=caption_model
+        )
+        indexer = VectorIndexer(
+            store_dir=store_dir,
+            audio_embed_model=audio_embed_model,
+            use_api=use_api
+        )
         if indexer.is_indexed(video_path) and not force_reindex:
             print(f"[Stage 1 Index Loader] Loaded Stage 1 store for '{os.path.basename(video_path)}'.")
             results[video_path] = {
@@ -460,10 +512,20 @@ def load_stage1_indices(
     if missing_videos:
         if allow_auto_ingest:
             print(f"\n[Stage 1 Index Loader] Missing Stage 1 indices for {len(missing_videos)} video(s). Running Stage 1 Ingestion automatically...")
-            ingestor = Stage1Ingestor(base_store_dir=base_store_dir)
+            ingestor = Stage1Ingestor(
+                base_store_dir=base_store_dir,
+                caption_model=caption_model,
+                audio_embed_model=audio_embed_model,
+                use_api=use_api
+            )
             for m_vpath in missing_videos:
                 idxer, reused, err = ingestor.process_single_video(m_vpath, force_reindex=force_reindex)
-                m_store_dir = get_video_store_dir(m_vpath, base_store_dir)
+                m_store_dir = get_video_store_dir(
+                    m_vpath, 
+                    base_store_dir,
+                    audio_embed_model=audio_embed_model,
+                    caption_model=caption_model
+                )
                 if idxer is not None:
                     results[m_vpath] = {
                         'indexer': idxer,
@@ -500,7 +562,13 @@ def process_dataset_pipeline(
     output_dir: str = "output",
     force_reindex: bool = False,
     auto_ingest: bool = False,
-    ablation_config: Optional[AblationConfig] = None
+    ablation_config: Optional[AblationConfig] = None,
+    llm_model: Optional[str] = None,
+    caption_model: Optional[str] = None,
+    audio_embed_model: Optional[str] = None,
+    use_api: Optional[bool] = None,
+    hf_token: Optional[str] = None,
+    llm_api_base: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Main batch processing workflow for EchoVision:
@@ -513,9 +581,16 @@ def process_dataset_pipeline(
     """
     cfg = ablation_config if ablation_config else AblationConfig()
 
+    active_llm = llm_model if llm_model else os.getenv("LLM_MODEL", ACTIVE_LLM_MODEL)
+    active_caption = caption_model if caption_model else os.getenv("CAPTION_MODEL", ACTIVE_CAPTION_MODEL)
+    active_audio_embed = audio_embed_model if audio_embed_model else os.getenv("AUDIO_EMBED_MODEL", ACTIVE_AUDIO_EMBED_MODEL)
+
     target_output_dir = output_dir
     if cfg.name != "full" and output_dir == "output":
         target_output_dir = os.path.join(output_dir, "ablations", cfg.name)
+    elif output_dir == "output":
+        m_tag = f"{active_llm.split('/')[-1]}_{active_caption.split('/')[-1]}_{active_audio_embed.split('/')[-1]}".replace(":", "_").replace("-", "_")
+        target_output_dir = os.path.join(output_dir, "models", m_tag)
 
     print("\n==================================================")
     print(f"      ECHOVISION BATCH DATASET PROCESSING         ")
@@ -532,7 +607,10 @@ def process_dataset_pipeline(
     stage1_results = load_stage1_indices(
         videos_dir=videos_dir,
         allow_auto_ingest=auto_ingest,
-        force_reindex=force_reindex
+        force_reindex=force_reindex,
+        audio_embed_model=active_audio_embed,
+        caption_model=active_caption,
+        use_api=use_api
     )
 
     discovered_videos = list(stage1_results.keys())
@@ -588,13 +666,17 @@ def process_dataset_pipeline(
                 print(f"[Dataset Pipeline WARNING] Question '{q_info['question_text']}' in file '{os.path.basename(jf)}' could not be matched to any video (identifier: '{q_info['video_identifier']}').")
 
     # Step 4: Initialize Stage 2 & 3 Shared Models for Question Answering
-    print("\n[QA Pipeline] Pre-loading Stage 2 & Stage 3 models for batch inference...")
+    print(f"\n[QA Pipeline] Pre-loading Stage 2 & Stage 3 models (LLM: {active_llm})...")
     shared_components = {
         'qc': QuestionClassifier(),
         'dedup': Deduplicator(),
         'reranker': ReRanker(),
         'gate': SufficiencyGate(),
-        'generator': Generator()
+        'generator': Generator(
+            model=active_llm,
+            api_base=llm_api_base,
+            api_key=hf_token
+        )
     }
 
     successful_questions = 0
@@ -764,7 +846,18 @@ if __name__ == "__main__":
     parser.add_argument("--fixed-cutoff", action="store_true", help="Shortcut for --sufficiency_mode fixed (Fixed cutoff evidence stop)")
     parser.add_argument("--no-audio", "--visual-only", dest="no_audio", action="store_true", help="Shortcut for --modality_mode visual_only (Audio removed entirely)")
 
+    # Model Selection Flags
+    parser.add_argument("--llm_model", type=str, default=None, help="LLM model (e.g. qwen2.5-v1-72b-instruct, gemma-4-31b, phi-3.5-vision-instruct, gpt-4o-mini)")
+    parser.add_argument("--caption_model", type=str, default=None, help="Captioning model (e.g. Salesforce/blip-image-captioning-base, Salesforce/blip-image-captioning-large, HuggingFaceTB/SmolVLM-256M-Instruct, wraps/moondream-caption)")
+    parser.add_argument("--audio_embed_model", type=str, default=None, help="Audio embedding model (e.g. FacebookAI/roberta-base, laion/clap-htsat-unfused)")
+    parser.add_argument("--use_api", action="store_true", help="Use Hugging Face / remote API inference instead of local execution")
+    parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face API token")
+    parser.add_argument("--llm_api_base", type=str, default=None, help="Custom OpenAI-compatible API base URL (e.g. https://router.huggingface.co/v1 or OpenRouter)")
+
     args = parser.parse_args()
+
+    if args.hf_token:
+        os.environ["HF_TOKEN"] = args.hf_token
 
     # Build AblationConfig
     store_mode = "joint" if args.joint_store else args.store_mode
@@ -789,7 +882,13 @@ if __name__ == "__main__":
             args.video, 
             args.question, 
             force_reindex=args.force_reindex,
-            ablation_config=ablation_cfg
+            ablation_config=ablation_cfg,
+            llm_model=args.llm_model,
+            caption_model=args.caption_model,
+            audio_embed_model=args.audio_embed_model,
+            use_api=args.use_api if args.use_api else None,
+            hf_token=args.hf_token,
+            llm_api_base=args.llm_api_base
         )
     else:
         # Default batch dataset mode
@@ -801,6 +900,12 @@ if __name__ == "__main__":
             output_dir=args.output_dir,
             force_reindex=args.force_reindex,
             auto_ingest=args.auto_ingest,
-            ablation_config=ablation_cfg
+            ablation_config=ablation_cfg,
+            llm_model=args.llm_model,
+            caption_model=args.caption_model,
+            audio_embed_model=args.audio_embed_model,
+            use_api=args.use_api if args.use_api else None,
+            hf_token=args.hf_token,
+            llm_api_base=args.llm_api_base
         )
 

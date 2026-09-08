@@ -30,9 +30,9 @@ EchoVision integrates an optimized multi-modal ensemble engineered to run reliab
 EchoVision can be executed directly in the cloud on **Google Colab** (Free Tier T4 GPU) or **Kaggle Notebooks** (GPU T4 x 1) with zero local installation required!
 
 ### 1. 🚀 Google Colab ([`EchoVision_Colab_T4.ipynb`](EchoVision_Colab_T4.ipynb))
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/G-shubham18/online_EVL/blob/main/EchoVision_Colab_T4.ipynb)
 
-1. Open [Google Colab](https://colab.research.google.com/) and click **Upload Notebook** $\rightarrow$ select [`EchoVision_Colab_T4.ipynb`](EchoVision_Colab_T4.ipynb).
+1. Click the **Open In Colab** badge above, or open [Google Colab](https://colab.research.google.com/) $\rightarrow$ **GitHub** $\rightarrow$ enter `https://github.com/G-shubham18/online_EVL` $\rightarrow$ select [`EchoVision_Colab_T4.ipynb`](EchoVision_Colab_T4.ipynb).
 2. Set Runtime accelerator: **Runtime** $\rightarrow$ **Change runtime type** $\rightarrow$ **T4 GPU** (15-16 GB VRAM).
 3. Set your optional `OPENAI_API_KEY` (via Colab Secrets or interactive prompt) to enable **GPT-4o-mini** for frame captioning, query classification, and answer generation.
 4. Run the notebook cells sequentially:
@@ -287,6 +287,59 @@ python main.py --dataset_dir smoketest --visual-only
 ##### Single Video QA Mode with Ablation
 ```bash
 python main.py --video smoketest/videos/v_0q9yZPTBbus.mp4 --question "what is in front of the person in red clothes" --ablation joint_store
+```
+
+---
+
+## 🔬 Multi-Model Evaluation & API Benchmark Suite (Take Results One-by-One)
+
+EchoVision supports evaluating different state-of-the-art vision, audio, and language models **one-by-one** via API (e.g. Hugging Face Serverless Inference API, OpenRouter, Groq, Together) or local GPU/CPU execution:
+
+| Category | Supported Models | Description |
+|:---|:---|:---|
+| **LLMs (Stage 3)** | `qwen2.5-v1-72b-instruct`<br>`gemma-4-31b`<br>`phi-3.5-vision-instruct` | SOTA text & multimodal reasoners accessed via HF Serverless Inference API (`InferenceClient`) or OpenAI-compatible endpoint. |
+| **Captioning (Stage 1)** | `Salesforce/blip-image-captioning-base`<br>`Salesforce/blip-image-captioning-large`<br>`HuggingFaceTB/SmolVLM-256M-Instruct`<br>`wraps/moondream-caption` | Vision-language captioners with automatic API and local transformers execution. |
+| **Audio Embeddings (Stage 1)** | `FacebookAI/roberta-base` | Dense 768-dim semantic representations for audio events & speech facts. |
+
+### 1. Run Automated Benchmarks One-by-One (`run_model_experiments.py`)
+
+To take results one by one across each model category and generate comparative reports:
+
+```bash
+# Set your Hugging Face API token for API version inference
+export HF_TOKEN="your_huggingface_api_token"  # On Windows PowerShell: $env:HF_TOKEN="your_token"
+
+# 1. Evaluate LLMs one-by-one (qwen2.5-72b, gemma-4-31b, phi-3.5-vision):
+python run_model_experiments.py --mode llm --use_api
+
+# 2. Evaluate Captioning models one-by-one (BLIP base, BLIP large, SmolVLM, Moondream):
+python run_model_experiments.py --mode caption
+
+# 3. Evaluate Audio Embedding model (FacebookAI/roberta-base):
+python run_model_experiments.py --mode audio
+
+# 4. Evaluate ALL models one-by-one:
+python run_model_experiments.py --mode all --use_api
+```
+
+*Outputs:*
+- Isolated prediction directories for each model: `output/model_benchmarks/<model_id>/`
+- Consolidated Markdown comparative report: `output/model_benchmarks/master_benchmark_summary.md`
+- Master JSON metrics file: `output/model_benchmarks/master_benchmark_summary.json`
+
+### 2. Run Single Model Runs with `main.py`
+
+You can also specify models directly via CLI flags:
+
+```bash
+# Run with specific LLM via API:
+python main.py --llm_model qwen2.5-v1-72b-instruct --use_api --hf_token "your_token"
+
+# Run with specific Captioning and Audio Embedding models:
+python main.py --caption_model Salesforce/blip-image-captioning-base --audio_embed_model FacebookAI/roberta-base --auto-ingest
+
+# Run with Custom OpenAI-compatible API endpoint (e.g. OpenRouter, Together, Groq):
+python main.py --llm_model gemma-4-31b --llm_api_base https://openrouter.ai/api/v1 --hf_token "your_key"
 ```
 
 ---

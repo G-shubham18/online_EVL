@@ -14,20 +14,127 @@ from config import (
     DEVICE, 
     IS_GPU,
     OPENAI_API_KEY,
-    GPT_MODEL
+    GPT_MODEL,
+    SUPPORTED_LLM_MODELS,
+    HF_TOKEN,
+    LLM_API_BASE,
+    LLM_API_KEY,
+    ACTIVE_LLM_MODEL,
+    USE_API
 )
 
 class Generator:
-    def __init__(self, backend: str = None, model: str = None):
+    def __init__(
+        self, 
+        backend: str = None, 
+        model: str = None, 
+        api_key: str = None, 
+        api_base: str = None
+    ):
         self.host = OLLAMA_HOST
-        self.model = model if model else OLLAMA_MODEL
+        raw_model = model if model else os.getenv("LLM_MODEL", ACTIVE_LLM_MODEL)
+        self.raw_model = raw_model
+        # Resolve model name or alias
+        self.model = SUPPORTED_LLM_MODELS.get(raw_model.lower().strip(), raw_model)
         self.max_tokens = OLLAMA_MAX_TOKENS
-        self.backend = (backend if backend else LLM_BACKEND).lower().strip()
-        self.hf_model_id = os.getenv("HF_LLM_MODEL", HF_LLM_MODEL)
+        
+        self.api_key = api_key if api_key else (LLM_API_KEY if LLM_API_KEY else os.getenv("HF_TOKEN", os.getenv("OPENAI_API_KEY", "")))
+        self.api_base = api_base if api_base else LLM_API_BASE
+        
+        if backend:
+            self.backend = backend.lower().strip()
+        else:
+            if self.api_key or self.api_base:
+                self.backend = "api"
+            else:
+                self.backend = (LLM_BACKEND if LLM_BACKEND else "auto").lower().strip()
+
+        self.hf_model_id = os.getenv("HF_LLM_MODEL", self.model if "/" in self.model else HF_LLM_MODEL)
         self.gpt_model = os.getenv("GPT_MODEL", GPT_MODEL)
-        self.api_key = os.getenv("OPENAI_API_KEY", OPENAI_API_KEY)
         self._hf_pipeline = None
         self._hf_tokenizer = None
+        self._hf_client = None
+
+    def _generate_api(self, prompt: str, question: str = "") -> Optional[str]:
+        """Generates answer using Hugging Face Inference API or custom OpenAI-compatible endpoint."""
+        # 1. Custom OpenAI-compatible endpoint (OpenRouter, Groq, Together, DeepInfra, vLLM, etc.)
+        if self.api_base:
+            try:
+                endpoint = self.api_base.rstrip("/")
+                if not endpoint.endswith("/chat/completions"):
+                    endpoint = f"{endpoint}/chat/completions"
+                headers = {"Content-Type": "application/json"}
+                if self.api_key:
+                    headers["Authorization"] = f"Bearer {self.api_key}"
+                payload = {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
+                    "max_tokens": self.max_tokens
+                }
+                print(f"[Stage 3 Generator] Querying API ({endpoint}) for model '{self.model}'...")
+                res = requests.post(endpoint, headers=headers, json=payload, timeout=30.0)
+                if res.status_code == 200:
+                    data = res.json()
+                    raw_ans = data["choices"][0]["message"]["content"].strip()
+                    return self.clean_answer(raw_ans, question=question)
+                else:
+                    print(f"[Stage 3 Generator Warning] Custom API returned status {res.status_code}: {res.text[:150]}")
+            except Exception as e:
+                print(f"[Stage 3 Generator Warning] Custom API call failed: {e}")
+
+        # 2. Hugging Face InferenceClient API
+        try:
+            from huggingface_hub import InferenceClient
+            if self._hf_client is None:
+                self._hf_client = InferenceClient(token=self.api_key if self.api_key else None)
+            
+            print(f"[Stage 3 Generator] Querying Hugging Face Inference API for model '{self.model}'...")
+            try:
+                chat_res = self._hf_client.chat_completion(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    temperature=0.01,
+                )
+                raw_ans = chat_res.choices[0].message.content.strip()
+                if raw_ans:
+                    return self.clean_answer(raw_ans, question=question)
+            except Exception as chat_err:
+                print(f"[Stage 3 Generator Notice] HF chat_completion notice: {chat_err}, trying text_generation...")
+                text_res = self._hf_client.text_generation(
+                    prompt,
+                    model=self.model,
+                    max_new_tokens=self.max_tokens,
+                    temperature=0.01,
+                )
+                if text_res:
+                    return self.clean_answer(text_res.strip(), question=question)
+        except Exception as e:
+            print(f"[Stage 3 Generator Warning] Hugging Face Inference API failed: {e}")
+
+        # 3. Direct router endpoint fallback for Hugging Face
+        if self.api_key:
+            try:
+                hf_url = "https://router.huggingface.co/v1/chat/completions"
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.0,
+                    "max_tokens": self.max_tokens
+                }
+                res = requests.post(hf_url, headers=headers, json=payload, timeout=30.0)
+                if res.status_code == 200:
+                    raw_ans = res.json()["choices"][0]["message"]["content"].strip()
+                    return self.clean_answer(raw_ans, question=question)
+            except Exception:
+                pass
+
+        return None
 
     def _generate_gpt(self, prompt: str, question: str = "") -> Optional[str]:
         """Generates answer using GPT-4o-mini via OpenAI API."""
@@ -247,18 +354,26 @@ Evidence:
 Question: {question}
 Short Answer:"""
 
-        # 1. Priority: GPT-4o-mini if configured or OPENAI_API_KEY is available
-        if self.backend == "gpt" or (self.backend == "auto" and os.getenv("OPENAI_API_KEY", self.api_key)):
-            gpt_ans = self._generate_gpt(prompt, question=question)
-            if gpt_ans and not gpt_ans.lower().startswith("error"):
-                return gpt_ans
-            print("[Stage 3 Generator] GPT generation unavailable/failed. Falling back to local backends...")
+        # 1. API Generation (Hugging Face Inference API / Custom API / OpenAI)
+        if self.backend in ["api", "auto"] or self.api_key or self.api_base:
+            if "gpt" in self.model.lower() and os.getenv("OPENAI_API_KEY"):
+                gpt_ans = self._generate_gpt(prompt, question=question)
+                if gpt_ans and not gpt_ans.lower().startswith("error"):
+                    return gpt_ans
+
+            api_ans = self._generate_api(prompt, question=question)
+            if api_ans and not api_ans.lower().startswith("error"):
+                return api_ans
+            if self.backend == "api":
+                print("[Stage 3 Generator] API generation returned None. Attempting local backends as fallback...")
+            else:
+                print("[Stage 3 Generator] API unavailable. Falling back to local backends...")
 
         # 2. Determine whether to use Ollama or HuggingFace
         use_ollama = False
         if self.backend == "ollama":
             use_ollama = True
-        elif self.backend == "auto":
+        elif self.backend in ["auto", "api"]:
             use_ollama = self._is_ollama_available()
         # If backend == "hf", use_ollama remains False
 

@@ -10,7 +10,9 @@ import torch
 from config import (
     VECTOR_STORE_DIR, CHROMA_AUDIO_COLLECTION, 
     FAISS_VISUAL_INDEX_PATH, VISUAL_METADATA_PATH,
-    CLAP_MODEL, CLIP_MODEL, TEXT_EMBEDDING_MODEL, DEVICE
+    CLAP_MODEL, CLIP_MODEL, TEXT_EMBEDDING_MODEL, DEVICE,
+    ACTIVE_AUDIO_EMBED_MODEL, SUPPORTED_AUDIO_EMBED_MODELS,
+    HF_TOKEN, USE_API
 )
 
 def is_video_indexed_on_disk(video_path: str, store_dir: str) -> bool:
@@ -40,35 +42,51 @@ def is_video_indexed_on_disk(video_path: str, store_dir: str) -> bool:
 class VectorIndexer:
     _shared_clap_model = None
     _shared_clap_processor = None
-    _shared_audio_embedder = None
+    _shared_audio_embedders = {}
     _shared_visual_embedder = None
     _models_initialized = False
 
     @classmethod
-    def _init_shared_models(cls):
-        if cls._models_initialized:
-            return
-        
-        # Audio Embedding Model (CLAP)
-        print(f"Loading CLAP Model for Audio Store: {CLAP_MODEL}")
-        try:
-            from transformers import ClapModel, ClapProcessor
-            cls._shared_clap_model = ClapModel.from_pretrained(CLAP_MODEL).to(DEVICE)
-            cls._shared_clap_processor = ClapProcessor.from_pretrained(CLAP_MODEL)
-            print(f"[VectorIndexer] Successfully loaded CLAP text encoder for audio store.")
-        except Exception as e:
-            print(f"[VectorIndexer Warning] Could not load CLAP via transformers: {e}. Falling back to sentence-transformers.")
-            cls._shared_audio_embedder = SentenceTransformer(TEXT_EMBEDDING_MODEL, device=DEVICE)
+    def _init_shared_models(cls, audio_embed_model: str = None):
+        if audio_embed_model is None:
+            audio_embed_model = os.getenv("AUDIO_EMBED_MODEL", ACTIVE_AUDIO_EMBED_MODEL)
+
+        # Audio Embedding Model (e.g. FacebookAI/roberta-base or CLAP)
+        if audio_embed_model not in cls._shared_audio_embedders:
+            if "clap" in audio_embed_model.lower():
+                print(f"Loading CLAP Model for Audio Store: {audio_embed_model}")
+                try:
+                    from transformers import ClapModel, ClapProcessor
+                    cls._shared_clap_model = ClapModel.from_pretrained(audio_embed_model).to(DEVICE)
+                    cls._shared_clap_processor = ClapProcessor.from_pretrained(audio_embed_model)
+                    cls._shared_audio_embedders[audio_embed_model] = "clap"
+                    print(f"[VectorIndexer] Successfully loaded CLAP text encoder for audio store.")
+                except Exception as e:
+                    print(f"[VectorIndexer Warning] Could not load CLAP via transformers: {e}. Falling back to sentence-transformers.")
+                    cls._shared_audio_embedders[audio_embed_model] = SentenceTransformer(TEXT_EMBEDDING_MODEL, device=DEVICE)
+            else:
+                print(f"Loading Audio Embedding Model ({audio_embed_model})...")
+                try:
+                    cls._shared_audio_embedders[audio_embed_model] = SentenceTransformer(audio_embed_model, device=DEVICE)
+                    print(f"[VectorIndexer] Successfully loaded Audio Embedding Model: {audio_embed_model}")
+                except Exception as e:
+                    print(f"[VectorIndexer Warning] SentenceTransformer could not load {audio_embed_model} ({e}). Falling back to {TEXT_EMBEDDING_MODEL}.")
+                    cls._shared_audio_embedders[audio_embed_model] = SentenceTransformer(TEXT_EMBEDDING_MODEL, device=DEVICE)
 
         # High-Speed SOTA Visual Text Embedding Model
-        print(f"Loading Dense Semantic Text Embedder for Visual Store: {TEXT_EMBEDDING_MODEL}")
-        cls._shared_visual_embedder = SentenceTransformer(TEXT_EMBEDDING_MODEL, device=DEVICE)
-        cls._models_initialized = True
+        if cls._shared_visual_embedder is None:
+            print(f"Loading Dense Semantic Text Embedder for Visual Store: {TEXT_EMBEDDING_MODEL}")
+            cls._shared_visual_embedder = SentenceTransformer(TEXT_EMBEDDING_MODEL, device=DEVICE)
 
-    def __init__(self, store_dir: str = None):
+    def __init__(self, store_dir: str = None, audio_embed_model: str = None, use_api: bool = None):
         self.store_dir = os.path.abspath(store_dir) if store_dir else VECTOR_STORE_DIR
         os.makedirs(self.store_dir, exist_ok=True)
         
+        self.audio_embed_model = audio_embed_model if audio_embed_model else os.getenv("AUDIO_EMBED_MODEL", ACTIVE_AUDIO_EMBED_MODEL)
+        self.use_api = use_api if use_api is not None else USE_API
+        self.hf_token = HF_TOKEN
+        self._hf_client = None
+
         self.faiss_path = os.path.join(self.store_dir, "visual_index.faiss")
         self.metadata_path = os.path.join(self.store_dir, "visual_metadata.json")
         self.joint_faiss_path = os.path.join(self.store_dir, "joint_index.faiss")
@@ -76,10 +94,10 @@ class VectorIndexer:
         self.video_info_path = os.path.join(self.store_dir, "indexed_video.json")
         self.chroma_dir = os.path.join(self.store_dir, "chroma")
 
-        self._init_shared_models()
+        self._init_shared_models(self.audio_embed_model)
         self.clap_model = self._shared_clap_model
         self.clap_processor = self._shared_clap_processor
-        self.audio_embedder = self._shared_audio_embedder
+        self.audio_embedder = self._shared_audio_embedders.get(self.audio_embed_model)
         self.visual_embedder = self._shared_visual_embedder
 
         # Initialize ChromaDB for Audio
@@ -162,9 +180,12 @@ class VectorIndexer:
         return None
 
     def set_indexed_video(self, video_path: str):
-        """Saves the absolute path of the newly indexed video."""
-        with open(self.video_info_path, "w") as f:
-            json.dump({"video_path": os.path.abspath(video_path)}, f)
+        """Saves the absolute path of the newly indexed video along with metadata."""
+        with open(self.video_info_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "video_path": os.path.abspath(video_path),
+                "audio_embed_model": self.audio_embed_model
+            }, f, indent=2)
 
     def is_indexed(self, video_path: str) -> bool:
         """Returns True if the specified video is already indexed in this store."""
@@ -178,26 +199,44 @@ class VectorIndexer:
         return False
 
     def embed_audio_text(self, text: str):
-        """Embeds audio text facts using CLAP's text encoder (or SentenceTransformer fallback)."""
-        if getattr(self, "clap_model", None) is not None and getattr(self, "clap_processor", None) is not None:
-            inputs = self.clap_processor(text=text, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
-            with torch.no_grad():
-                outputs = self.clap_model.get_text_features(**inputs)
-                if isinstance(outputs, torch.Tensor):
-                    tensor = outputs
-                elif hasattr(outputs, "text_embeds"):
-                    tensor = outputs.text_embeds
-                elif hasattr(outputs, "pooler_output"):
-                    tensor = outputs.pooler_output
-                else:
-                    tensor = outputs[0]
-            embed = tensor.cpu().numpy()[0]
-        else:
-            embed = self.audio_embedder.encode(text, convert_to_numpy=True)
+        """Embeds audio text facts using configured model (e.g. FacebookAI/roberta-base, CLAP, or SentenceTransformer)."""
+        embed = None
+        # 1. Try Hugging Face API feature extraction if enabled
+        if self.use_api and self.hf_token and "clap" not in self.audio_embed_model.lower():
+            try:
+                from huggingface_hub import InferenceClient
+                if self._hf_client is None:
+                    self._hf_client = InferenceClient(token=self.hf_token)
+                res = self._hf_client.feature_extraction(text=text, model=self.audio_embed_model)
+                if isinstance(res, np.ndarray) and res.size > 0:
+                    embed = res.flatten()
+            except Exception:
+                pass
+
+        # 2. Local Model Inference
+        if embed is None:
+            if "clap" in self.audio_embed_model.lower() and getattr(self, "clap_model", None) is not None and getattr(self, "clap_processor", None) is not None:
+                inputs = self.clap_processor(text=text, return_tensors="pt", padding=True, truncation=True).to(DEVICE)
+                with torch.no_grad():
+                    outputs = self.clap_model.get_text_features(**inputs)
+                    if isinstance(outputs, torch.Tensor):
+                        tensor = outputs
+                    elif hasattr(outputs, "text_embeds"):
+                        tensor = outputs.text_embeds
+                    elif hasattr(outputs, "pooler_output"):
+                        tensor = outputs.pooler_output
+                    else:
+                        tensor = outputs[0]
+                embed = tensor.cpu().numpy()[0]
+            elif self.audio_embedder is not None and hasattr(self.audio_embedder, "encode"):
+                embed = self.audio_embedder.encode(text, convert_to_numpy=True)
+            else:
+                embed = self.visual_embedder.encode(text, convert_to_numpy=True)
+
         norm = np.linalg.norm(embed)
         if norm > 0:
             embed = embed / norm
-        return embed
+        return embed.astype("float32")
 
     def embed_visual_text(self, text: str):
         """Embeds text descriptions using dense semantic text embedder with L2 normalization."""
