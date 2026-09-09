@@ -29,7 +29,10 @@ class Generator:
         backend: str = None, 
         model: str = None, 
         api_key: str = None, 
-        api_base: str = None
+        api_base: str = None,
+        use_api: bool = None,
+        hf_token: str = None,
+        **kwargs
     ):
         self.host = OLLAMA_HOST
         raw_model = model if model else os.getenv("LLM_MODEL", ACTIVE_LLM_MODEL)
@@ -38,11 +41,14 @@ class Generator:
         self.model = SUPPORTED_LLM_MODELS.get(raw_model.lower().strip(), raw_model)
         self.max_tokens = OLLAMA_MAX_TOKENS
         
-        self.api_key = api_key if api_key else (LLM_API_KEY if LLM_API_KEY else os.getenv("HF_TOKEN", os.getenv("OPENAI_API_KEY", "")))
+        token_key = hf_token if hf_token else os.getenv("HF_TOKEN", "")
+        self.api_key = api_key if api_key else (token_key if token_key else (LLM_API_KEY if LLM_API_KEY else os.getenv("OPENAI_API_KEY", "")))
         self.api_base = api_base if api_base else LLM_API_BASE
         
         if backend:
             self.backend = backend.lower().strip()
+        elif use_api:
+            self.backend = "api"
         else:
             if self.api_key or self.api_base:
                 self.backend = "api"

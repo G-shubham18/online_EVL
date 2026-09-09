@@ -79,13 +79,16 @@ class Stage1Ingestor:
         concurrent: Optional[bool] = None,
         caption_model: Optional[str] = None,
         audio_embed_model: Optional[str] = None,
-        use_api: Optional[bool] = None
+        use_api: Optional[bool] = None,
+        hf_token: Optional[str] = None,
+        **kwargs
     ):
         self.base_store_dir = base_store_dir if base_store_dir else VECTOR_STORE_DIR
         self.concurrent = concurrent if concurrent is not None else CONCURRENT_INGESTION
         self.caption_model = caption_model if caption_model else os.getenv("CAPTION_MODEL", ACTIVE_CAPTION_MODEL)
         self.audio_embed_model = audio_embed_model if audio_embed_model else os.getenv("AUDIO_EMBED_MODEL", ACTIVE_AUDIO_EMBED_MODEL)
         self.use_api = use_api if use_api is not None else USE_API
+        self.hf_token = hf_token if hf_token else (HF_TOKEN if HF_TOKEN else os.getenv("HF_TOKEN", ""))
         self.audio_extractor = None
         self.visual_extractor = None
 
@@ -98,7 +101,11 @@ class Stage1Ingestor:
         if self.visual_extractor is None:
             print(f"[Stage 1 Ingestion] Initializing VisualExtractor model ({self.caption_model})...")
             from stage1_offline.visual_extractor import VisualExtractor
-            self.visual_extractor = VisualExtractor(caption_model=self.caption_model, use_api=self.use_api)
+            self.visual_extractor = VisualExtractor(
+                caption_model=self.caption_model, 
+                use_api=self.use_api,
+                hf_token=self.hf_token
+            )
 
     def process_single_video(
         self,

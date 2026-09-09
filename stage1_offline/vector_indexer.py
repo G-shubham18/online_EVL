@@ -78,13 +78,13 @@ class VectorIndexer:
             print(f"Loading Dense Semantic Text Embedder for Visual Store: {TEXT_EMBEDDING_MODEL}")
             cls._shared_visual_embedder = SentenceTransformer(TEXT_EMBEDDING_MODEL, device=DEVICE)
 
-    def __init__(self, store_dir: str = None, audio_embed_model: str = None, use_api: bool = None):
+    def __init__(self, store_dir: str = None, audio_embed_model: str = None, use_api: bool = None, hf_token: str = None, **kwargs):
         self.store_dir = os.path.abspath(store_dir) if store_dir else VECTOR_STORE_DIR
         os.makedirs(self.store_dir, exist_ok=True)
         
         self.audio_embed_model = audio_embed_model if audio_embed_model else os.getenv("AUDIO_EMBED_MODEL", ACTIVE_AUDIO_EMBED_MODEL)
         self.use_api = use_api if use_api is not None else USE_API
-        self.hf_token = HF_TOKEN
+        self.hf_token = hf_token if hf_token else (HF_TOKEN if HF_TOKEN else os.getenv("HF_TOKEN", ""))
         self._hf_client = None
 
         self.faiss_path = os.path.join(self.store_dir, "visual_index.faiss")

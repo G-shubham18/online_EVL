@@ -79,13 +79,15 @@ Visible Text & Labels: Any readable text or brands.
 Be factual, specific, and concise without filler."""
 
 class VisualExtractor:
-    def __init__(self, caption_model: str = None, use_api: bool = None):
+    def __init__(self, caption_model: str = None, use_api: bool = None, hf_token: str = None, **kwargs):
         self.openai_api_key = os.getenv("OPENAI_API_KEY", OPENAI_API_KEY)
         self.gpt_model = os.getenv("GPT_MODEL", GPT_MODEL)
         self.caption_model = caption_model if caption_model else os.getenv("CAPTION_MODEL", ACTIVE_CAPTION_MODEL)
         self.use_api = use_api if use_api is not None else USE_API
-        self.hf_token = HF_TOKEN
+        self.hf_token = hf_token if hf_token else (HF_TOKEN if HF_TOKEN else os.getenv("HF_TOKEN", ""))
         self._hf_client = None
+        self._hf_api_disabled = False
+        self._hf_api_warned = False
 
         self.model = None
         self.processor = None
@@ -210,14 +212,27 @@ class VisualExtractor:
 
     def _caption_frame_api(self, pil_image: Image.Image) -> Optional[str]:
         """Calls Hugging Face Inference API for image captioning."""
+        if getattr(self, "_hf_api_disabled", False):
+            return None
+
         try:
             from huggingface_hub import InferenceClient
             if self._hf_client is None:
-                self._hf_client = InferenceClient(token=self.hf_token if self.hf_token else None)
+                try:
+                    self._hf_client = InferenceClient(provider="hf-inference", token=self.hf_token if self.hf_token else None)
+                except (TypeError, ValueError):
+                    self._hf_client = InferenceClient(token=self.hf_token if self.hf_token else None)
             
-            # 1. Try image_to_text endpoint
+            import io, base64
+            buf = io.BytesIO()
+            img_c = pil_image.copy()
+            img_c.thumbnail((512, 512))
+            img_c.save(buf, format="JPEG", quality=85)
+            img_bytes = buf.getvalue()
+
+            # 1. Try image_to_text endpoint with binary payload
             try:
-                res = self._hf_client.image_to_text(pil_image, model=self.caption_model)
+                res = self._hf_client.image_to_text(img_bytes, model=self.caption_model)
                 if isinstance(res, str) and res.strip():
                     return res.strip()
                 elif hasattr(res, "generated_text") and res.generated_text:
@@ -225,33 +240,47 @@ class VisualExtractor:
             except Exception:
                 pass
 
-            # 2. Try chat completion with base64 encoded image
-            import io, base64
-            buf = io.BytesIO()
-            img_c = pil_image.copy()
-            img_c.thumbnail((512, 512))
-            img_c.save(buf, format="JPEG", quality=85)
-            b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
-            data_url = f"data:image/jpeg;base64,{b64_str}"
+            # 2. Try chat completion ONLY for models that support chat/vlm interfaces.
+            # BLIP family models (e.g. Salesforce/blip-*) are pure image-to-text models
+            # and NOT chat models. Sending them to /v1/chat/completions causes:
+            # "The requested model 'Salesforce/blip-...' is not a chat model."
+            model_name = self.caption_model.lower()
+            is_chat_vlm = any(k in model_name for k in ["instruct", "smolvlm", "qwen", "chat", "vl-", "vision"]) and "blip" not in model_name
 
-            chat_res = self._hf_client.chat_completion(
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Describe this video frame accurately and concisely."},
-                            {"type": "image_url", "image_url": {"url": data_url}}
-                        ]
-                    }
-                ],
-                model=self.caption_model,
-                max_tokens=150,
-            )
-            raw = chat_res.choices[0].message.content.strip()
-            if raw:
-                return raw
+            if is_chat_vlm:
+                b64_str = base64.b64encode(img_bytes).decode("utf-8")
+                data_url = f"data:image/jpeg;base64,{b64_str}"
+
+                chat_res = self._hf_client.chat_completion(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Describe this video frame accurately and concisely."},
+                                {"type": "image_url", "image_url": {"url": data_url}}
+                            ]
+                        }
+                    ],
+                    model=self.caption_model,
+                    max_tokens=150,
+                )
+                raw = chat_res.choices[0].message.content.strip()
+                if raw:
+                    return raw
+            else:
+                # If non-chat model (like BLIP) cannot be reached via HF serverless image_to_text,
+                # disable HF API and fall back to local model inference cleanly.
+                if not getattr(self, "_hf_api_warned", False):
+                    print(f"[VisualExtractor Notice] Model '{self.caption_model}' is not a chat model and HF Serverless image_to_text is unavailable. Automatically using local model inference.")
+                    self._hf_api_warned = True
+                self._hf_api_disabled = True
+                return None
+
         except Exception as e:
-            print(f"[VisualExtractor Notice] HF Caption API notice: {e}")
+            if not getattr(self, "_hf_api_warned", False):
+                print(f"[VisualExtractor Notice] HF Caption API notice: {e}. Switching to local model fallback.")
+                self._hf_api_warned = True
+            self._hf_api_disabled = True
         return None
 
     def _load_local_caption_model(self):
